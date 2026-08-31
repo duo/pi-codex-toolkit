@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Node ${{ matrix.node }} (${{ matrix.lane }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: engine floor
+            node: 22.19.0
+            npm: 10.9.3
+          - lane: current LTS
+            node: 24.20.0
+            npm: 11.19.0
+    env:
+      CI: "true"
+      NPM_CONFIG_AUDIT: "false"
+      NPM_CONFIG_FUND: "false"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+
+      - name: Verify toolchain
+        env:
+          EXPECTED_NODE: v${{ matrix.node }}
+          EXPECTED_NPM: ${{ matrix.npm }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_node="$(node --version)"
+          actual_npm="$(npm --version)"
+          printf 'node=%s\nnpm=%s\n' "$actual_node" "$actual_npm"
+          [[ "$actual_node" == "$EXPECTED_NODE" ]]
+          [[ "$actual_npm" == "$EXPECTED_NPM" ]]
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run tests
+        run: npm test
+
+      - name: Check types
+        run: npm run typecheck
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Inspect package payload
+        run: npm pack --dry-run --ignore-scripts
