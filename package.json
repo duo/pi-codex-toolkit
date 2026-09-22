@@ -1,6 +1,6 @@
 {
   "name": "pi-codex-toolkit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Bounded OpenAI and Codex capabilities for Pi",
   "keywords": [
     "pi-package",
@@ -27,7 +27,9 @@
   },
   "files": [
     "src",
-    "docs",
+    "docs/en",
+    "docs/zh",
+    "docs/third-party",
     "README.md",
     "README.zh-CN.md",
     "CHANGELOG.md",
@@ -40,23 +42,29 @@
     ]
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.scripts.json",
+    "lint": "eslint src tests vitest.config.ts",
     "test": "vitest run",
-    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\" package.json tsconfig.json",
-    "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\" package.json tsconfig.json"
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-include=src/status.ts --test-coverage-lines=98 --test-coverage-functions=100 --test-coverage-branches=100 tests/status-contract.node-test.mjs",
+    "test:coverage:project": "vitest run --coverage",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\" package.json tsconfig.json tsconfig.scripts.json vitest.config.ts eslint.config.js",
+    "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\" package.json tsconfig.json tsconfig.scripts.json vitest.config.ts eslint.config.js"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "^0.87.0",
+    "@earendil-works/pi-coding-agent": "^0.87.0",
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.84.4",
-    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-ai": "0.87.0",
+    "@earendil-works/pi-coding-agent": "0.87.0",
     "@types/node": "22.19.19",
+    "@vitest/coverage-istanbul": "4.1.9",
+    "eslint": "10.10.0",
     "prettier": "3.6.2",
     "typebox": "1.3.7",
     "typescript": "5.9.3",
+    "typescript-eslint": "8.70.0",
     "vitest": "4.1.9"
   }
 }

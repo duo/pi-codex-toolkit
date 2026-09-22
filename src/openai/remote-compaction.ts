@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import {
-  calculateCost,
+  normalizeContext,
   type Message,
   type Model,
   type Provider,
@@ -20,8 +20,10 @@ import {
 
 import {
   codexAccountIdFromToken,
+  layerOptionalHeaders,
   type AuthenticatedOfficialRoute,
 } from "./route.ts";
+import { parseResponsesUsage } from "./usage.ts";
 
 export const REMOTE_COMPACTION_KIND =
   "pi-codex-toolkit.remote-compaction-v2" as const;
@@ -111,47 +113,6 @@ const PAYLOAD_CAPTURE_NETWORK_BLOCKED =
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function numberValue(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-    ? value
-    : undefined;
-}
-
-function parseUsage(value: unknown, model: Model<any>): Usage | undefined {
-  if (!isRecord(value)) return undefined;
-  const inputTokens = numberValue(value.input_tokens);
-  const outputTokens = numberValue(value.output_tokens);
-  const totalTokens = numberValue(value.total_tokens);
-  if (
-    inputTokens === undefined ||
-    outputTokens === undefined ||
-    totalTokens === undefined
-  ) {
-    return undefined;
-  }
-
-  const inputDetails = isRecord(value.input_tokens_details)
-    ? value.input_tokens_details
-    : {};
-  const outputDetails = isRecord(value.output_tokens_details)
-    ? value.output_tokens_details
-    : {};
-  const cacheRead = numberValue(inputDetails.cached_tokens) ?? 0;
-  const cacheWrite = numberValue(inputDetails.cache_write_tokens) ?? 0;
-  const reasoning = numberValue(outputDetails.reasoning_tokens);
-  const usage: Usage = {
-    input: Math.max(0, inputTokens - cacheRead - cacheWrite),
-    output: outputTokens,
-    cacheRead,
-    cacheWrite,
-    ...(reasoning === undefined ? {} : { reasoning }),
-    totalTokens,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-  };
-  calculateCost(model, usage);
-  return usage;
 }
 
 export function resolveRemoteCompactionIdentity(
@@ -348,6 +309,10 @@ function capturedRemotePayload(
   };
 }
 
+function conversationMessages(messages: readonly Message[]): Message[] {
+  return messages.filter((message) => message.role !== "system");
+}
+
 export async function captureRemoteCompactionPayload(input: {
   provider: Pick<Provider, "stream">;
   route: AuthenticatedOfficialRoute;
@@ -366,11 +331,11 @@ export async function captureRemoteCompactionPayload(input: {
   try {
     const stream = input.provider.stream(
       input.route.model,
-      {
+      normalizeContext({
         systemPrompt: input.systemPrompt,
-        messages: [...input.messages],
+        messages: conversationMessages(input.messages),
         ...(input.tools.length > 0 ? { tools: [...input.tools] } : {}),
-      },
+      }),
       {
         apiKey: input.route.token,
         fetch: unreachableFetch,
@@ -490,10 +455,10 @@ export function buildRemoteCompactionHeaders(input: {
   route: AuthenticatedOfficialRoute;
   accountId: string;
 }): Headers {
-  const headers = new Headers(input.route.model.headers);
-  for (const [key, value] of Object.entries(input.route.headers)) {
-    headers.set(key, value);
-  }
+  const headers = layerOptionalHeaders(
+    input.route.model.headers,
+    input.route.headers,
+  );
   headers.set("authorization", `Bearer ${input.route.token}`);
   headers.set("chatgpt-account-id", input.accountId);
   headers.set("originator", "pi");
@@ -563,7 +528,7 @@ export async function parseRemoteCompactionResponse(
       const responseValue = isRecord(event.response)
         ? event.response
         : undefined;
-      usage = parseUsage(responseValue?.usage, model);
+      usage = parseResponsesUsage(responseValue?.usage, model);
     }
   };
 

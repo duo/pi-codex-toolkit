@@ -109,17 +109,34 @@ export class ComputerUseClientError extends Error {
   }
 }
 
+interface Invocation {
+  child: ChildProcessWithoutNullStreams;
+  signal?: AbortSignal;
+  approvalHandler?: ApprovalHandler;
+  confirmation: AbortController;
+  active: boolean;
+}
+
 interface PendingRequest {
+  id: number;
+  child: ChildProcessWithoutNullStreams;
+  invocation?: Invocation;
   resolve(value: unknown): void;
   reject(error: ComputerUseClientError): void;
-  timer: ReturnType<typeof setTimeout>;
+  timer?: ReturnType<typeof setTimeout>;
+  remainingMs: number;
+  activeStartedAt: number;
+  approvalWaiters: number;
   signal?: AbortSignal;
   abort?: () => void;
   dispatched: boolean;
   unknownOnFailure: boolean;
 }
 
-type ApprovalHandler = (message: string) => Promise<boolean>;
+type ApprovalHandler = (
+  message: string,
+  signal: AbortSignal,
+) => boolean | Promise<boolean>;
 
 export interface ComputerUseClientOptions {
   runtime: ComputerUseRuntime;
@@ -152,20 +169,30 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function waitForProcessClose(
-  child: ChildProcessWithoutNullStreams,
-): Promise<void> {
+function stopProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) {
     return Promise.resolve();
   }
-  return new Promise((resolve) => {
-    const finish = (): void => {
+  return new Promise((resolve, reject) => {
+    const finish = (error?: ComputerUseClientError): void => {
       clearTimeout(timer);
-      child.off("close", finish);
-      resolve();
+      child.off("close", closed);
+      if (error) reject(error);
+      else resolve();
     };
-    const timer = setTimeout(finish, PROCESS_EXIT_GRACE_MS);
-    child.once("close", finish);
+    const closed = (): void => finish();
+    const timer = setTimeout(
+      () => finish(new ComputerUseClientError("process-exit")),
+      PROCESS_EXIT_GRACE_MS,
+    );
+    child.once("close", closed);
+    try {
+      // Signal submission (including false) is not a close observation.
+      // A racing exit may still close stdio within the existing grace.
+      child.kill();
+    } catch {
+      finish(new ComputerUseClientError("process-exit"));
+    }
   });
 }
 
@@ -196,14 +223,19 @@ export class ComputerUseClient {
   private readonly temporaryRoot: string;
   private child?: ChildProcessWithoutNullStreams;
   private temporaryHome?: string;
+  // Inactive for RPC/UI, but still owned until stop/removal is confirmed.
+  private retiredChild?: ChildProcessWithoutNullStreams;
+  private retiredHome?: string;
   private threadId?: string;
   private stdoutBuffer = "";
   private nextId = 1;
   private pending = new Map<number, PendingRequest>();
   private approvedApps = new Set<string>();
   private starting?: Promise<void>;
-  private approvalHandler?: ApprovalHandler;
+  private invocation?: Invocation;
+  private cleanupError?: ComputerUseClientError;
   private closed = false;
+  private closing?: Promise<void>;
   private resetting?: Promise<void>;
   private requiresInspection = false;
 
@@ -221,6 +253,11 @@ export class ComputerUseClient {
     return this.closed;
   }
 
+  /** Failed transport cleanup needs an explicit retry before new transport. */
+  get hasCleanupError(): boolean {
+    return this.cleanupError !== undefined;
+  }
+
   async invoke(
     method: ComputerUseMethod,
     args: Record<string, unknown>,
@@ -233,7 +270,16 @@ export class ComputerUseClient {
     }
 
     await this.ensureStarted(signal);
-    this.approvalHandler = approvalHandler;
+    const child = this.child;
+    if (!child || this.closed) throw new ComputerUseClientError("closed");
+    const invocation: Invocation = {
+      child,
+      signal,
+      approvalHandler,
+      confirmation: new AbortController(),
+      active: true,
+    };
+    this.invocation = invocation;
     try {
       const result = await this.callNodeRepl(
         buildComputerUseJavaScript(method, args),
@@ -241,6 +287,7 @@ export class ComputerUseClient {
         signal,
         TOOL_TIMEOUT_MS,
         isComputerUseAction(method),
+        invocation,
       );
       let converted: ComputerUseToolResult;
       try {
@@ -263,7 +310,8 @@ export class ComputerUseClient {
       }
       throw error;
     } finally {
-      this.approvalHandler = undefined;
+      this.invalidateInvocation(invocation);
+      if (this.invocation === invocation) this.invocation = undefined;
     }
   }
 
@@ -284,34 +332,73 @@ export class ComputerUseClient {
     }
   }
 
+  /** Reclaim retired transport without discarding live-client safety state. */
+  async retryCleanup(): Promise<void> {
+    if (this.closed) return this.close();
+    if (this.resetting) return this.resetting;
+    if (this.cleanupError) await this.resetTransport(this.cleanupError);
+  }
+
   async close(): Promise<void> {
-    if (this.closed && this.resetting) return this.resetting;
+    if (this.closing) return this.closing;
     this.closed = true;
-    return this.resetTransport(new ComputerUseClientError("closed"));
+    // Reset invalidates RPC/UI now. Joining startup also owns a home whose
+    // allocation has not returned yet. Reset itself must never join startup:
+    // startup's error boundary awaits reset, so that would create a cycle.
+    this.closing = Promise.allSettled([
+      this.resetTransport(new ComputerUseClientError("closed")),
+      this.starting,
+    ])
+      .then(([reset]) => {
+        // Startup's request error belongs to its caller; its cleanup failure
+        // belongs to close as well and is retained by resetTransport.
+        if (this.cleanupError) throw this.cleanupError;
+        if (reset.status === "rejected") throw reset.reason;
+      })
+      .finally(() => {
+        this.closing = undefined;
+      });
+    return this.closing;
   }
 
   private async ensureStarted(signal?: AbortSignal): Promise<void> {
     if (this.closed) throw new ComputerUseClientError("closed");
     if (this.resetting) await this.resetting;
+    if (this.cleanupError) throw this.cleanupError;
+    if (this.closed) throw new ComputerUseClientError("closed");
     if (this.threadId) return;
     if (!this.starting) {
-      this.starting = this.start(signal).catch(async (error) => {
-        const normalized =
-          error instanceof ComputerUseClientError
-            ? error
-            : new ComputerUseClientError("node-repl-unavailable");
-        await this.resetTransport(normalized);
-        throw normalized;
-      });
+      const starting = this.start(signal)
+        .catch(async (error) => {
+          const normalized =
+            error instanceof ComputerUseClientError &&
+            error.category !== "timeout"
+              ? error
+              : new ComputerUseClientError("node-repl-unavailable");
+          if (this.resetting) await this.resetting;
+          if (this.cleanupError) throw this.cleanupError;
+          // Startup stays registered until its own cleanup settles, fencing
+          // replacement and letting close join late allocation cleanup.
+          await this.resetTransport(normalized);
+          throw normalized;
+        })
+        .finally(() => {
+          if (this.starting === starting) this.starting = undefined;
+        });
+      this.starting = starting;
     }
     await this.starting;
   }
 
   private async start(signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) throw new ComputerUseClientError("aborted");
-    this.temporaryHome = await mkdtemp(
+    const temporaryHome = await mkdtemp(
       join(this.temporaryRoot, "pi-codex-toolkit-computer-use-"),
     );
+    this.temporaryHome = temporaryHome;
+    if (this.closed || signal?.aborted) {
+      throw new ComputerUseClientError(this.closed ? "closed" : "aborted");
+    }
     const child = spawn(this.runtime.codexPath, this.appServerArgs, {
       cwd: this.temporaryHome,
       env: { ...this.environment, CODEX_HOME: this.temporaryHome },
@@ -319,10 +406,11 @@ export class ComputerUseClient {
     });
     this.child = child;
     child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => this.onStdout(chunk));
+    child.stdin.on("error", () => this.failTransport(child, "process-exit"));
+    child.stdout.on("data", (chunk: string) => this.onStdout(child, chunk));
     child.stderr.resume();
-    child.once("error", () => this.onProcessFailure());
-    child.once("exit", () => this.onProcessFailure());
+    child.on("error", () => this.failTransport(child, "process-exit"));
+    child.once("exit", () => this.failTransport(child, "process-exit"));
 
     await this.request(
       "initialize",
@@ -330,7 +418,7 @@ export class ComputerUseClient {
         clientInfo: {
           name: "pi-codex-toolkit",
           title: "Pi Codex Toolkit",
-          version: "0.1.0",
+          version: "0.2.0",
         },
         capabilities: {
           experimentalApi: true,
@@ -340,7 +428,7 @@ export class ComputerUseClient {
       },
       signal,
     );
-    this.writeNotification("initialized");
+    this.writeNotification(child, "initialized");
 
     const started = await this.request(
       "thread/start",
@@ -368,8 +456,9 @@ export class ComputerUseClient {
     ) {
       throw new ComputerUseClientError("invalid-response");
     }
+    if (this.child !== child) throw new ComputerUseClientError("process-exit");
     this.threadId = started.thread.id;
-    await this.waitForNodeRepl(signal);
+    await this.waitForNodeRepl(child, signal);
   }
 
   private threadConfig(): Record<string, unknown> {
@@ -398,9 +487,14 @@ export class ComputerUseClient {
     };
   }
 
-  private async waitForNodeRepl(signal?: AbortSignal): Promise<void> {
+  private async waitForNodeRepl(
+    child: ChildProcessWithoutNullStreams,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const deadline = Date.now() + this.startupTimeoutMs;
     while (Date.now() < deadline) {
+      if (this.child !== child)
+        throw new ComputerUseClientError("process-exit");
       let cursor: string | null = null;
       let sawNodeRepl = false;
       do {
@@ -455,6 +549,7 @@ export class ComputerUseClient {
     signal?: AbortSignal,
     timeoutMs = TOOL_TIMEOUT_MS,
     unknownOnFailure = false,
+    invocation?: Invocation,
   ): Promise<{ content: unknown[] }> {
     const response = await this.request(
       "mcpServer/tool/call",
@@ -467,6 +562,7 @@ export class ComputerUseClient {
       signal,
       Math.min(this.requestTimeoutMs, timeoutMs + 10_000),
       unknownOnFailure,
+      invocation,
     );
     if (!isRecord(response)) {
       throw new ComputerUseClientError("invalid-response", unknownOnFailure);
@@ -486,87 +582,158 @@ export class ComputerUseClient {
     signal?: AbortSignal,
     timeoutMs = this.requestTimeoutMs,
     unknownOnFailure = false,
+    invocation?: Invocation,
   ): Promise<unknown> {
     if (signal?.aborted) {
       return Promise.reject(new ComputerUseClientError("aborted"));
     }
-    const child = this.child;
-    if (!child || this.closed || !child.stdin.writable) {
+    const child = invocation?.child ?? this.child;
+    if (
+      !child ||
+      this.child !== child ||
+      this.closed ||
+      !child.stdin.writable
+    ) {
       return Promise.reject(new ComputerUseClientError("closed"));
     }
 
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const pending: PendingRequest = {
+        id,
+        child,
+        invocation,
         resolve,
         reject,
         dispatched: false,
         unknownOnFailure,
-        timer: setTimeout(() => {
-          if (!this.pending.delete(id)) return;
-          this.removeAbort(pending);
-          const error = new ComputerUseClientError(
-            "timeout",
-            pending.dispatched && pending.unknownOnFailure,
-          );
-          reject(error);
-          void this.resetTransport(error);
-        }, timeoutMs),
+        remainingMs: timeoutMs,
+        activeStartedAt: performance.now(),
+        approvalWaiters: 0,
         signal,
       };
       if (signal) {
         pending.abort = () => {
           if (!this.pending.delete(id)) return;
           clearTimeout(pending.timer);
+          this.removeAbort(pending);
           const error = new ComputerUseClientError(
             "aborted",
             pending.dispatched && pending.unknownOnFailure,
           );
           reject(error);
-          if (pending.dispatched) void this.resetTransport(error);
+          if (pending.dispatched) this.failTransport(child, error.category);
         };
         signal.addEventListener("abort", pending.abort, { once: true });
       }
       this.pending.set(id, pending);
-      try {
-        child.stdin.write(`${JSON.stringify({ method, id, params })}\n`);
-        pending.dispatched = true;
-      } catch {
-        this.settleError(id, new ComputerUseClientError("process-exit"));
-        void this.resetTransport(new ComputerUseClientError("process-exit"));
-      }
+      this.armRequestTimer(pending);
+      this.writeMessage(child, { method, id, params }, pending);
     });
   }
 
-  private writeNotification(method: string): void {
-    const child = this.child;
-    if (!child || !child.stdin.writable) {
-      throw new ComputerUseClientError("closed");
+  private hasRequestBudget(pending: PendingRequest): boolean {
+    if (
+      this.pending.get(pending.id) !== pending ||
+      this.child !== pending.child
+    )
+      return false;
+    if (pending.approvalWaiters === 0) {
+      const now = performance.now();
+      pending.remainingMs -= now - pending.activeStartedAt;
+      pending.activeStartedAt = now;
     }
-    child.stdin.write(`${JSON.stringify({ method })}\n`);
+    if (pending.remainingMs > 0) return true;
+    this.pending.delete(pending.id);
+    this.removeAbort(pending);
+    const error = new ComputerUseClientError(
+      "timeout",
+      pending.dispatched && pending.unknownOnFailure,
+    );
+    pending.reject(error);
+    this.failTransport(pending.child, error.category);
+    return false;
   }
 
-  private onStdout(chunk: string): void {
+  private armRequestTimer(pending: PendingRequest): void {
+    const timer = setTimeout(() => {
+      // A superseded callback must not erase a replacement or resume a pause.
+      if (pending.timer !== timer || pending.approvalWaiters > 0) return;
+      pending.timer = undefined;
+      // Node may deliver a rounded timer early. Never refill its remainder.
+      if (this.hasRequestBudget(pending)) this.armRequestTimer(pending);
+    }, pending.remainingMs);
+    pending.timer = timer;
+  }
+
+  private pauseForApproval(pending: PendingRequest): (() => void) | undefined {
+    if (!this.hasRequestBudget(pending)) return;
+    clearTimeout(pending.timer);
+    pending.timer = undefined;
+    pending.approvalWaiters++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (this.pending.get(pending.id) !== pending) return;
+      if (--pending.approvalWaiters !== 0) return;
+      pending.activeStartedAt = performance.now();
+      if (this.hasRequestBudget(pending)) this.armRequestTimer(pending);
+    };
+  }
+
+  private writeMessage(
+    child: ChildProcessWithoutNullStreams,
+    message: unknown,
+    pending?: PendingRequest,
+  ): void {
+    if (this.child !== child || this.closed) return;
+    try {
+      if (!child.stdin.writable) {
+        this.failTransport(child, "process-exit");
+        return;
+      }
+      const line = `${JSON.stringify(message)}\n`;
+      // Submission is potentially dispatch, not application acknowledgement.
+      if (pending) pending.dispatched = true;
+      child.stdin.write(line, (error) => {
+        if (error) this.failTransport(child, "process-exit");
+      });
+    } catch {
+      this.failTransport(child, "process-exit");
+    }
+  }
+
+  private writeNotification(
+    child: ChildProcessWithoutNullStreams,
+    method: string,
+  ): void {
+    this.writeMessage(child, { method });
+    if (this.child !== child) throw new ComputerUseClientError("process-exit");
+  }
+
+  private onStdout(child: ChildProcessWithoutNullStreams, chunk: string): void {
+    if (this.child !== child) return;
     this.stdoutBuffer += chunk;
-    while (true) {
+    while (this.child === child) {
       const newline = this.stdoutBuffer.indexOf("\n");
       if (newline < 0) return;
       const line = this.stdoutBuffer.slice(0, newline).trim();
       this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
-      if (line) this.onLine(line);
+      if (line) this.onLine(child, line);
     }
   }
 
-  private onLine(line: string): void {
+  private onLine(child: ChildProcessWithoutNullStreams, line: string): void {
     let message: unknown;
     try {
       message = JSON.parse(line);
     } catch {
-      this.failTransport("invalid-response");
+      this.failTransport(child, "invalid-response");
       return;
     }
     if (!isRecord(message)) {
-      this.failTransport("invalid-response");
+      this.failTransport(child, "invalid-response");
       return;
     }
 
@@ -574,11 +741,16 @@ export class ComputerUseClient {
       (typeof message.id === "number" || typeof message.id === "string") &&
       typeof message.method === "string"
     ) {
-      void this.handleServerRequest(message);
+      void this.handleServerRequest(child, message).catch(() => {
+        this.failTransport(child, "process-exit");
+      });
       return;
     }
 
-    if (typeof message.id === "number" && this.pending.has(message.id)) {
+    if (
+      typeof message.id === "number" &&
+      this.pending.get(message.id)?.child === child
+    ) {
       if ("error" in message) {
         this.settleError(
           message.id,
@@ -587,23 +759,38 @@ export class ComputerUseClient {
       } else if ("result" in message) {
         this.settleResult(message.id, message.result);
       } else {
-        this.failTransport("invalid-response");
+        this.failTransport(child, "invalid-response");
       }
       return;
     }
   }
 
   private async handleServerRequest(
+    child: ChildProcessWithoutNullStreams,
     request: Record<string, unknown>,
   ): Promise<void> {
     if (request.method !== "mcpServer/elicitation/request") {
-      this.writeServerError(request.id as number | string);
+      this.writeServerError(child, request.id as number | string);
       return;
     }
+    const invocation = this.invocation;
+    // Capture the exact request, never rediscover a replacement after UI waits.
+    const pending = invocation
+      ? [...this.pending.values()].find(
+          (entry) => entry.invocation === invocation,
+        )
+      : undefined;
+    const authorized = (): boolean =>
+      !!invocation &&
+      !!pending &&
+      this.isActiveInvocation(child, invocation) &&
+      this.hasRequestBudget(pending);
     const params = request.params;
     let accepted = false;
     let persisted = false;
     if (
+      invocation &&
+      authorized() &&
       isRecord(params) &&
       params.threadId === this.threadId &&
       params.serverName === "node_repl" &&
@@ -619,14 +806,38 @@ export class ComputerUseClient {
       persisted = this.approvedApps.has(app);
       if (persisted) {
         accepted = true;
-      } else if (this.approvalHandler) {
-        accepted = await this.approvalHandler(params.message).catch(
-          () => false,
-        );
+      } else if (invocation.approvalHandler) {
+        try {
+          const decision = invocation.approvalHandler(
+            params.message,
+            invocation.confirmation.signal,
+          );
+          if (typeof decision === "boolean") {
+            accepted = decision;
+          } else {
+            // Observe even if callback reentrancy retired/expired the request.
+            const observed = Promise.resolve(decision).catch(() => false);
+            const release =
+              authorized() && pending
+                ? this.pauseForApproval(pending)
+                : undefined;
+            if (!release) return;
+            try {
+              accepted = await observed;
+            } finally {
+              release();
+            }
+          }
+        } catch {
+          accepted = false;
+        }
+        if (!authorized()) return;
         if (accepted) this.approvedApps.add(app);
       }
     }
+    if (invocation && !authorized()) return;
     this.writeServerResult(
+      child,
       request.id as number | string,
       accepted
         ? persisted
@@ -647,18 +858,36 @@ export class ComputerUseClient {
     );
   }
 
-  private writeServerResult(id: number | string, result: unknown): void {
-    const child = this.child;
-    if (!child || !child.stdin.writable) return;
-    child.stdin.write(`${JSON.stringify({ id, result })}\n`);
+  private isActiveInvocation(
+    child: ChildProcessWithoutNullStreams,
+    invocation: Invocation,
+  ): boolean {
+    return (
+      !this.closed &&
+      this.child === child &&
+      invocation.child === child &&
+      this.invocation === invocation &&
+      invocation.active &&
+      !invocation.signal?.aborted
+    );
   }
 
-  private writeServerError(id: number | string): void {
-    const child = this.child;
-    if (!child || !child.stdin.writable) return;
-    child.stdin.write(
-      `${JSON.stringify({ id, error: { code: -32601, message: "Unsupported request" } })}\n`,
-    );
+  private writeServerResult(
+    child: ChildProcessWithoutNullStreams,
+    id: number | string,
+    result: unknown,
+  ): void {
+    this.writeMessage(child, { id, result });
+  }
+
+  private writeServerError(
+    child: ChildProcessWithoutNullStreams,
+    id: number | string,
+  ): void {
+    this.writeMessage(child, {
+      id,
+      error: { code: -32601, message: "Unsupported request" },
+    });
   }
 
   private settleResult(id: number, result: unknown): void {
@@ -679,7 +908,15 @@ export class ComputerUseClient {
     pending.reject(error);
   }
 
+  private invalidateInvocation(invocation: Invocation): void {
+    invocation.active = false;
+    invocation.confirmation.abort();
+  }
+
   private removeAbort(pending: PendingRequest): void {
+    clearTimeout(pending.timer);
+    pending.timer = undefined;
+    if (pending.invocation) this.invalidateInvocation(pending.invocation);
     if (pending.signal && pending.abort) {
       pending.signal.removeEventListener("abort", pending.abort);
     }
@@ -699,36 +936,48 @@ export class ComputerUseClient {
     }
   }
 
-  private failTransport(category: ComputerUseClientErrorCategory): void {
-    void this.resetTransport(new ComputerUseClientError(category));
-  }
-
-  private onProcessFailure(): void {
-    void this.resetTransport(new ComputerUseClientError("process-exit"));
+  private failTransport(
+    child: ChildProcessWithoutNullStreams,
+    category: ComputerUseClientErrorCategory,
+  ): void {
+    if (this.child !== child) return;
+    void this.resetTransport(new ComputerUseClientError(category)).catch(() => {
+      // Keep failed cleanup visible at the next owned invoke/close boundary.
+      this.cleanupError = new ComputerUseClientError("process-exit");
+    });
   }
 
   private resetTransport(error: ComputerUseClientError): Promise<void> {
     if (this.resetting) return this.resetting;
     this.rejectPending(error);
-    const child = this.child;
-    const temporaryHome = this.temporaryHome;
+    if (this.invocation) this.invalidateInvocation(this.invocation);
+    this.invocation = undefined;
+    this.retiredChild ??= this.child;
+    this.retiredHome ??= this.temporaryHome;
     this.child = undefined;
     this.temporaryHome = undefined;
     this.threadId = undefined;
-    this.starting = undefined;
     this.stdoutBuffer = "";
     this.resetting = (async () => {
-      if (child && child.exitCode === null && child.signalCode === null) {
-        const closed = waitForProcessClose(child);
-        child.kill();
-        await closed;
+      if (this.retiredChild) {
+        await stopProcess(this.retiredChild);
+        this.retiredChild = undefined;
       }
-      if (temporaryHome) {
-        await rm(temporaryHome, { recursive: true, force: true });
+      // Never remove a home while the owned child could recreate it. Failed
+      // resources stay reachable for a later explicit cleanup/close retry.
+      if (this.retiredHome) {
+        await rm(this.retiredHome, { recursive: true, force: true });
+        this.retiredHome = undefined;
       }
-    })().finally(() => {
-      this.resetting = undefined;
-    });
+      this.cleanupError = undefined;
+    })()
+      .catch(() => {
+        this.cleanupError = new ComputerUseClientError("process-exit");
+        throw this.cleanupError;
+      })
+      .finally(() => {
+        this.resetting = undefined;
+      });
     return this.resetting;
   }
 }

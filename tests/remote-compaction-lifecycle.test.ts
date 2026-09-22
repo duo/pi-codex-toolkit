@@ -23,12 +23,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { defaultConfig } from "../src/config.ts";
 import { APPLY_PATCH_LARK_GRAMMAR } from "../src/apply-patch.ts";
+import { EXEC_LARK_GRAMMAR } from "../src/code-mode/tools.ts";
 import piCodexToolkit, {
   APPLY_PATCH_TOOL,
   WEB_SEARCH_TOOL,
 } from "../src/index.ts";
 import { REMOTE_COMPACTION_KIND } from "../src/openai/remote-compaction.ts";
+import * as remoteCompaction from "../src/openai/remote-compaction.ts";
 import { codexModel, otherModel } from "./fixtures.ts";
+import { withEventBus } from "./fixtures/extension-events.ts";
 
 const temporaryDirectories: string[] = [];
 const codexProvider: Pick<Provider, "stream"> = {
@@ -131,6 +134,7 @@ function captureProvider(
   return {
     stream: ((currentModel, _context, options) => {
       const stream = createAssistantMessageEventStream();
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises -- cannot reject: the catch receives the Error the capture hook throws, and Pi 0.84.4 EventStream push()/end() do not throw; stream() must return synchronously
       void Promise.resolve().then(async () => {
         if (invokePayload) {
           try {
@@ -171,9 +175,12 @@ function captureProvider(
   };
 }
 
-function extensionHarness(branch: { entries: CompactionEntry[] }) {
+function extensionHarness(
+  branch: { entries: CompactionEntry[] },
+  options: { extraTools?: ToolInfo[]; active?: string[] } = {},
+) {
   const handlers = new Map<string, ExtensionHandler<any, any>>();
-  let activeTools = ["read"];
+  let activeTools = options.active ?? ["read"];
   const sourcePath = fileURLToPath(new URL("../src/index.ts", import.meta.url));
   const tools: ToolInfo[] = [
     {
@@ -209,20 +216,35 @@ function extensionHarness(branch: { entries: CompactionEntry[] }) {
         origin: "package",
       },
     },
+    ...(options.extraTools ?? []),
   ];
+  // Pi 0.87 projects `definition.parameters` by reference, and that identity
+  // is how a factory proves a registration is its own. Record what the factory
+  // registers so an entry at this extension's path carries its schema object;
+  // a foreign owner keeps the literal one written above.
+  const registered = new Map<string, { parameters: unknown }>();
   const pi = {
-    registerTool: () => undefined,
+    registerTool: (tool: { name: string; parameters: unknown }) => {
+      registered.set(tool.name, tool);
+    },
     registerCommand: () => undefined,
     on: (event: string, handler: ExtensionHandler<any, any>) => {
       handlers.set(event, handler);
     },
     getActiveTools: () => activeTools,
-    getAllTools: () => tools,
+    getAllTools: () =>
+      tools.map((tool) => {
+        const own =
+          tool.sourceInfo.path === sourcePath
+            ? registered.get(tool.name)
+            : undefined;
+        return own ? { ...tool, parameters: own.parameters } : tool;
+      }),
     setActiveTools: (names: string[]) => {
       activeTools = names;
     },
   } as unknown as ExtensionAPI;
-  piCodexToolkit(pi);
+  piCodexToolkit(withEventBus(pi));
   return { handlers, getActiveTools: () => activeTools };
 }
 
@@ -251,6 +273,331 @@ async function configureAgent(
   await writeFile(path, JSON.stringify(config), "utf8");
   return { directory, path };
 }
+
+describe("Provider hook exceptional resolution diagnostics", () => {
+  it.each([
+    [false, false, "auth"],
+    [true, false, "auth"],
+    [false, true, "auth"],
+    [true, true, "auth"],
+    [false, false, "identity"],
+    [true, false, "identity"],
+    [false, true, "identity"],
+    [true, true, "identity"],
+  ] as const)(
+    "debug=%s priorRemote=%s failure=%s preserves fallback and refresh",
+    async (debug, priorRemote, failure) => {
+      const previousAgentDirectory = process.env.PI_CODING_AGENT_DIR;
+      const configured = await configureAgent((config) => {
+        config.debug = debug;
+        config.remoteCompaction.enabled = priorRemote;
+        config.webSearch.enabled = !priorRemote;
+        config.webSearch.backend = "native";
+      });
+      process.env.PI_CODING_AGENT_DIR = configured.directory;
+      try {
+        const current = codexModel();
+        const token = jwt("PRIVATE_ACCOUNT");
+        const identity = remoteCompaction.resolveRemoteCompactionIdentity({
+          model: current,
+          token,
+          headers: {},
+          route: {
+            kind: "codex-oauth",
+            endpoint: new URL(
+              "https://chatgpt.com/backend-api/codex/responses",
+            ),
+          },
+        })!;
+        const marker = `[${REMOTE_COMPACTION_KIND}:test]`;
+        const branch = {
+          entries: (priorRemote
+            ? [
+                {
+                  type: "compaction",
+                  id: "prior",
+                  parentId: null,
+                  timestamp: new Date(0).toISOString(),
+                  summary: marker + " PRIVATE_SUMMARY",
+                  firstKeptEntryId: "kept",
+                  tokensBefore: 100,
+                  details: {
+                    kind: REMOTE_COMPACTION_KIND,
+                    version: 1,
+                    marker,
+                    retainedInput: [
+                      { role: "user", content: "PRIVATE_RETAINED" },
+                    ],
+                    checkpoint: {
+                      type: "compaction",
+                      encrypted_content: "PRIVATE_CHECKPOINT",
+                    },
+                    compatibility: identity.compatibility,
+                  },
+                },
+              ]
+            : []) as CompactionEntry[],
+        };
+        const beforeBranch = structuredClone(branch.entries);
+        const harness = extensionHarness(branch);
+        const currentRegistry = registry(current, token);
+        const ctx = context(current, currentRegistry, branch);
+        const fetchSpy = vi
+          .spyOn(globalThis, "fetch")
+          .mockRejectedValue(new Error("unexpected transport"));
+        const debugSpy = vi
+          .spyOn(console, "error")
+          .mockImplementation(() => undefined);
+        await harness.handlers.get("session_start")?.(
+          { type: "session_start", reason: "startup" },
+          ctx,
+        );
+        debugSpy.mockClear();
+        if (failure === "auth") {
+          currentRegistry.getApiKeyAndHeaders.mockRejectedValueOnce(
+            new Error(
+              `PRIVATE_AUTH_ERROR ${token} PRIVATE_HEADER ${identity.compatibility.accountFingerprint}`,
+            ),
+          );
+        } else {
+          vi.spyOn(
+            remoteCompaction,
+            "resolveRemoteCompactionIdentity",
+          ).mockImplementationOnce(() => {
+            throw new Error(
+              `PRIVATE_IDENTITY_ERROR ${token} PRIVATE_UI ${identity.compatibility.accountFingerprint}`,
+            );
+          });
+        }
+        const payload = {
+          input: [{ role: "user", content: marker + " PRIVATE_SUMMARY" }],
+          tools: [],
+          unknown: { private: "PRIVATE_PAYLOAD" },
+        };
+        const beforePayload = structuredClone(payload);
+        const hook = harness.handlers.get("before_provider_request")!;
+        const result = await hook(
+          { type: "before_provider_request", payload },
+          ctx,
+        );
+        expect(result).toBeUndefined();
+        expect(payload).toEqual(beforePayload);
+        expect(branch.entries).toEqual(beforeBranch);
+        expect(fetchSpy).not.toHaveBeenCalled();
+        expect(currentRegistry.getApiKeyAndHeaders).toHaveBeenCalledOnce();
+        expect(debugSpy).toHaveBeenCalledTimes(debug ? 1 : 0);
+        if (debug) {
+          expect(JSON.parse(debugSpy.mock.calls[0]![0] as string)).toEqual({
+            feature: "provider-request",
+            provider: current.provider,
+            api: current.api,
+            model: current.id,
+            errorCategory: "route-resolution-failed",
+          });
+        }
+        expect(JSON.stringify(debugSpy.mock.calls)).not.toContain("PRIVATE_");
+        expect(JSON.stringify(debugSpy.mock.calls)).not.toContain(token);
+        expect(JSON.stringify(debugSpy.mock.calls)).not.toContain(
+          identity.compatibility.accountFingerprint,
+        );
+        // Failure is not cached: next applicable request refreshes again and transforms.
+        const recovered = await hook(
+          { type: "before_provider_request", payload },
+          ctx,
+        );
+        expect(recovered).toBeDefined();
+        if (priorRemote) {
+          expect(recovered.input).toContainEqual({
+            type: "compaction",
+            encrypted_content: "PRIVATE_CHECKPOINT",
+          });
+        } else {
+          expect(recovered.tools).toContainEqual(
+            expect.objectContaining({ type: "web_search" }),
+          );
+        }
+        expect(payload).toEqual(beforePayload);
+        expect(branch.entries).toEqual(beforeBranch);
+        expect(currentRegistry.getApiKeyAndHeaders).toHaveBeenCalledTimes(2);
+        expect(fetchSpy).not.toHaveBeenCalled();
+        expect(debugSpy).toHaveBeenCalledTimes(debug ? 1 : 0);
+      } finally {
+        if (previousAgentDirectory === undefined)
+          delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = previousAgentDirectory;
+      }
+    },
+  );
+});
+
+describe("owned exec grammar in the remote-compaction projection", () => {
+  const sourcePath = fileURLToPath(new URL("../src/index.ts", import.meta.url));
+  const codeModeTools = (owner: string): ToolInfo[] =>
+    ["exec", "wait"].map((name) => ({
+      name,
+      description: `Toolkit ${name}`,
+      parameters:
+        name === "exec"
+          ? Type.Object({ code: Type.String() })
+          : Type.Object({ cell_id: Type.Optional(Type.String()) }),
+      sourceInfo: {
+        path: owner,
+        source: "test",
+        scope: "user",
+        origin: "package",
+      },
+    })) as ToolInfo[];
+
+  /** One assistant turn whose exec call arrived as raw custom-tool input. */
+  function execHistory(model: Model<any>): AssistantMessage[] {
+    return [
+      {
+        role: "assistant",
+        // A different model produced this turn, so the converter also takes
+        // its cross-model identity path for the custom tool call.
+        api: model.api,
+        provider: model.provider,
+        model: "gpt-5-previous",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_exec_1|ctc_exec_1",
+            name: "exec",
+            arguments: { code: 'print("history");' },
+          },
+        ],
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "toolUse",
+        timestamp: 1,
+      } as unknown as AssistantMessage,
+    ];
+  }
+
+  async function compactionRequest(
+    owner: string,
+    current: Model<any>,
+    history: AssistantMessage[] = [],
+  ): Promise<{ tools: unknown[]; input: unknown[] }> {
+    const branch = { entries: [] as CompactionEntry[] };
+    const harness = extensionHarness(branch, {
+      extraTools: codeModeTools(owner),
+      active: ["read", "exec", "wait"],
+    });
+    const currentRegistry = registry(current);
+    const ctx = context(current, currentRegistry, branch);
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(remoteResponse("cmp_exec"));
+    await harness.handlers.get("session_start")?.(
+      { type: "session_start", reason: "startup" },
+      ctx,
+    );
+    // A model change recomputes the projection for the new model.
+    await harness.handlers.get("model_select")?.(
+      { type: "model_select", model: current, source: "user" },
+      ctx,
+    );
+    await harness.handlers.get("session_before_compact")?.(
+      {
+        type: "session_before_compact",
+        preparation: preparation(
+          history.length > 0 ? { messagesToSummarize: history } : {},
+        ),
+        branchEntries: [],
+        reason: "threshold",
+        willRetry: false,
+        signal: new AbortController().signal,
+      },
+      ctx,
+    );
+    return JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body)) as {
+      tools: unknown[];
+      input: unknown[];
+    };
+  }
+
+  it("restores the exec grammar for the owned winner and never for a foreign one", async () => {
+    const previousAgentDirectory = process.env.PI_CODING_AGENT_DIR;
+    const configured = await configureAgent((config) => {
+      config.remoteCompaction.enabled = true;
+      config.codeMode.enabled = true;
+      config.shellSessions.enabled = true;
+    });
+    process.env.PI_CODING_AGENT_DIR = configured.directory;
+    try {
+      const grammarModel = codexModel({
+        compat: { supportsOpenAIGrammarTools: true },
+      });
+      const owned = await compactionRequest(sourcePath, grammarModel);
+      expect(owned.tools).toContainEqual({
+        type: "custom",
+        name: "exec",
+        description: "Toolkit exec",
+        format: {
+          type: "grammar",
+          syntax: "lark",
+          definition: EXEC_LARK_GRAMMAR,
+        },
+      });
+      // `wait` stays an ordinary JSON tool; only exec carries the grammar.
+      expect(owned.tools).toContainEqual(
+        expect.objectContaining({ type: "function", name: "wait" }),
+      );
+
+      // Pi 0.87 omits constrainedSampling from getAllTools(), so a foreign
+      // winner must not inherit the Toolkit's grammar.
+      const foreign = await compactionRequest("/foreign-exec.ts", grammarModel);
+      expect(foreign.tools).toContainEqual(
+        expect.objectContaining({ type: "function", name: "exec" }),
+      );
+      expect(JSON.stringify(foreign.tools)).not.toContain("pragma_source");
+
+      // A model without grammar support keeps the ordinary JSON transport.
+      const jsonOnly = await compactionRequest(sourcePath, codexModel());
+      expect(jsonOnly.tools).toContainEqual(
+        expect.objectContaining({ type: "function", name: "exec" }),
+      );
+
+      // Raw custom-tool history survives the compaction projection and the
+      // model change: the source stays the custom call's literal input.
+      const replayed = await compactionRequest(
+        sourcePath,
+        grammarModel,
+        execHistory(grammarModel),
+      );
+      expect(replayed.input).toContainEqual({
+        type: "custom_tool_call",
+        call_id: "call_exec_1",
+        name: "exec",
+        input: 'print("history");',
+      });
+      // Without the grammar the same history replays as a function call.
+      const replayedAsJson = await compactionRequest(
+        "/foreign-exec.ts",
+        grammarModel,
+        execHistory(grammarModel),
+      );
+      expect(replayedAsJson.input).toContainEqual(
+        expect.objectContaining({
+          type: "function_call",
+          name: "exec",
+          arguments: JSON.stringify({ code: 'print("history");' }),
+        }),
+      );
+    } finally {
+      if (previousAgentDirectory === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDirectory;
+    }
+  });
+});
 
 describe("Remote Compaction extension lifecycle", () => {
   it("preserves consecutive, reload/fork, model-switch, disable, and replay order", async () => {

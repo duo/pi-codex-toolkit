@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   createAssistantMessageEventStream,
@@ -12,6 +15,7 @@ import type {
   SessionBeforeCompactEvent,
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 
@@ -33,7 +37,10 @@ import {
   type RemoteCompactionCompatibility,
   type RemoteCompactionDetailsV1,
 } from "../src/openai/remote-compaction.ts";
-import type { AuthenticatedOfficialRoute } from "../src/openai/route.ts";
+import {
+  resolveOfficialRoute,
+  type AuthenticatedOfficialRoute,
+} from "../src/openai/route.ts";
 import { codexModel, model } from "./fixtures.ts";
 
 const codexProvider: Pick<Provider, "stream"> = {
@@ -254,6 +261,25 @@ describe("Remote Compaction identity and durable shape", () => {
         checkpoint: { type: "message", content: "not opaque" },
       }),
     ).toBe(false);
+    // A stored fingerprint is exactly "sha256:" plus 64 lowercase hex digits. A
+    // digit short, uppercase, unprefixed and empty values are all malformed.
+    const fingerprintHex = createHash("sha256")
+      .update("account-123")
+      .digest("hex");
+    for (const accountFingerprint of [
+      `sha256:${fingerprintHex.slice(1)}`,
+      `sha256:${fingerprintHex.toUpperCase()}`,
+      fingerprintHex,
+      "",
+    ]) {
+      const malformed = details({
+        compatibility: compatibility({ accountFingerprint }),
+      });
+      expect(isRemoteCompactionDetails(malformed)).toBe(false);
+      expect(
+        newestRemoteCompaction([compactionEntry(malformed)]),
+      ).toBeUndefined();
+    }
 
     const oldRemote = compactionEntry(valid);
     const native = compactionEntry(undefined, "native summary", "native-newer");
@@ -315,7 +341,7 @@ describe("Remote Compaction fallback and retained input", () => {
 });
 
 describe("Remote Compaction request and response", () => {
-  it("captures Pi 0.84.4 provider input and tools without transport", async () => {
+  it("captures Pi 0.87 provider input and tools without transport", async () => {
     const currentRoute = route({ headers: { "x-refreshed": "safe" } });
     let providerFetch: ReturnType<typeof vi.fn> | undefined;
     const observingProvider = {
@@ -352,6 +378,44 @@ describe("Remote Compaction request and response", () => {
     ]);
     expect(observingProvider.stream).toHaveBeenCalledOnce();
     expect(providerFetch).not.toHaveBeenCalled();
+  });
+
+  it("ignores saved native system state while capturing current tools", async () => {
+    const currentRoute = route();
+    const stale: Tool = {
+      name: "stale_tool",
+      description: "removed schema",
+      parameters: Type.Object({ path: Type.String() }),
+    };
+    const current: Tool = {
+      name: "read",
+      description: "current schema",
+      parameters: Type.Object({ path: Type.String() }),
+    };
+    const captured = await captureRemoteCompactionPayload({
+      provider: codexProvider,
+      route: currentRoute,
+      messages: [
+        {
+          role: "system",
+          content: "stale-native-prompt",
+          toolsAdded: [stale],
+          timestamp: 1,
+        },
+        { role: "user", content: "hello", timestamp: 2 },
+      ],
+      systemPrompt: "current-prompt",
+      tools: [current],
+    });
+
+    expect(JSON.stringify(captured?.input)).toContain("hello");
+    expect(JSON.stringify(captured?.input)).not.toContain(
+      "stale-native-prompt",
+    );
+    expect(JSON.stringify(captured?.tools)).not.toContain("stale_tool");
+    expect(captured?.tools).toEqual([
+      expect.objectContaining({ type: "function", name: "read" }),
+    ]);
   });
 
   it.each([
@@ -402,6 +466,7 @@ describe("Remote Compaction request and response", () => {
           if (!extraEvent) return inner;
 
           const outer = createAssistantMessageEventStream();
+          // eslint-disable-next-line @typescript-eslint/no-floating-promises -- cannot reject: Pi 0.84.4 EventStream iteration, push() and end() do not throw; stream() must return outer synchronously
           void (async () => {
             for await (const event of inner) {
               if (event.type === "error") {
@@ -434,6 +499,74 @@ describe("Remote Compaction request and response", () => {
       expect(remoteFetch).not.toHaveBeenCalled();
     },
   );
+
+  it("applies nullable refreshed headers at the actual Remote dispatch boundary", async () => {
+    const original = route({
+      model: codexModel({
+        headers: {
+          "X-Optional": "old",
+          "X-Replaced": "old",
+          "X-Kept": "kept",
+          "X-Codex-Beta-Features": "old_feature",
+        },
+      }),
+    });
+    const resolved = await resolveOfficialRoute(
+      {
+        getApiKeyAndHeaders: async () => ({
+          ok: true,
+          apiKey: original.token,
+          headers: {
+            "x-optional": null,
+            "x-replaced": "new",
+            "X-Absent": null,
+            Authorization: null,
+            "ChatGPT-Account-ID": null,
+            Originator: null,
+            "OpenAI-Beta": null,
+            Accept: null,
+            "Content-Type": null,
+            "x-codex-beta-features": null,
+          },
+        }),
+        isUsingOAuth: () => true,
+      },
+      original.model,
+    );
+    if (!resolved.ok) throw new Error("test route unavailable");
+    let emitted: Headers | undefined;
+    const fetchImpl = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      emitted = new Headers(init?.headers);
+      return successfulResponse();
+    });
+    const result = await createRemoteCompaction(
+      {
+        provider: codexProvider,
+        route: resolved.value,
+        identity: resolveRemoteCompactionIdentity(resolved.value)!,
+        preparation: preparation(),
+        branchEntries: [],
+        systemPrompt: "system",
+        tools: [],
+      },
+      fetchImpl,
+    );
+    expect(result).toBeDefined();
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(emitted?.has("X-Optional")).toBe(false);
+    expect(emitted?.has("x-absent")).toBe(false);
+    expect(emitted?.get("x-replaced")).toBe("new");
+    expect(emitted?.get("x-kept")).toBe("kept");
+    expect(emitted?.get("authorization")).toBe(`Bearer ${original.token}`);
+    expect(emitted?.get("chatgpt-account-id")).toBe("account-123");
+    expect(emitted?.get("originator")).toBe("pi");
+    expect(emitted?.get("openai-beta")).toBe("responses=experimental");
+    expect(emitted?.get("accept")).toBe("text/event-stream");
+    expect(emitted?.get("content-type")).toBe("application/json");
+    expect(emitted?.get("x-codex-beta-features")).toBe("remote_compaction_v2");
+    emitted!.forEach((value) => expect(value).not.toBe("null"));
+    expect(original.model.headers?.["X-Optional"]).toBe("old");
+  });
 
   it("sends one minimal request, overrides stale headers, and returns Pi boundaries", async () => {
     const currentRoute = route({
@@ -552,6 +685,177 @@ describe("Remote Compaction request and response", () => {
     expect(JSON.stringify(result?.details?.retainedInput)).not.toContain(
       "native readable summary",
     );
+  });
+
+  it("does not revive prompt or tools from a prior native systemMessage", async () => {
+    const currentRoute = route();
+    const native: CompactionEntry = {
+      ...compactionEntry(undefined, "native readable summary"),
+      systemMessage: {
+        role: "system",
+        content: "stale-native-prompt",
+        toolsAdded: [
+          {
+            name: "stale_tool",
+            description: "removed",
+            parameters: Type.Object({ path: Type.String() }),
+          },
+        ],
+        timestamp: 1,
+      },
+    };
+    const fetchImpl = vi.fn(async () =>
+      successfulResponse(),
+    ) as unknown as typeof fetch;
+    const ordinaryTool: Tool = {
+      name: "read",
+      description: "Read a file",
+      parameters: Type.Object({ path: Type.String() }),
+    };
+    const result = await createRemoteCompaction(
+      {
+        provider: codexProvider,
+        route: currentRoute,
+        identity: resolveRemoteCompactionIdentity(currentRoute)!,
+        preparation: preparation({ previousSummary: native.summary }),
+        branchEntries: [native],
+        systemPrompt: "current-prompt",
+        tools: [ordinaryTool],
+      },
+      fetchImpl,
+    );
+
+    const body = JSON.parse(
+      (
+        (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock
+          .calls[0]![1] as RequestInit
+      ).body as string,
+    ) as {
+      instructions?: string;
+      input: unknown[];
+      tools: unknown[];
+    };
+    expect(body.instructions).toBe("current-prompt");
+    expect(JSON.stringify(body)).not.toContain("stale-native-prompt");
+    expect(JSON.stringify(body)).not.toContain("stale_tool");
+    expect(JSON.stringify(body.input)).toContain("native readable summary");
+    expect(body.tools).toEqual([
+      expect.objectContaining({ type: "function", name: "read" }),
+    ]);
+    expect(result?.firstKeptEntryId).toBe("kept-entry");
+  });
+
+  it("persists native systemMessage through SessionManager open/fork without reviving tools", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pct-remote-session-"));
+    const sessionDir = join(root, "sessions");
+    await mkdir(sessionDir);
+    try {
+      const manager = SessionManager.create(root, sessionDir);
+      manager.appendMessage({
+        role: "system",
+        content: "stale-native-prompt",
+        toolsAdded: [
+          {
+            name: "stale_tool",
+            description: "removed",
+            parameters: Type.Object({ path: Type.String() }),
+          },
+        ],
+        timestamp: Date.now(),
+      });
+      const firstKeptEntryId = manager.appendMessage({
+        role: "user",
+        content: "hello",
+        timestamp: Date.now(),
+      });
+      manager.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "ok" }],
+        api: "openai-codex-responses",
+        provider: "openai-codex",
+        model: "gpt-5-codex",
+        usage: {
+          input: 1,
+          output: 1,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 2,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      });
+      manager.appendMessage({
+        role: "user",
+        content: "later",
+        timestamp: Date.now(),
+      });
+      const compactId = manager.appendCompaction(
+        "native readable summary",
+        firstKeptEntryId,
+        5_000,
+      );
+      const sessionFile = manager.getSessionFile();
+      if (!sessionFile)
+        throw new Error("SessionManager.create did not persist");
+      const reopened = SessionManager.open(sessionFile);
+      const native = reopened.getEntry(compactId) as CompactionEntry;
+      expect(native.type).toBe("compaction");
+      expect(
+        native.systemMessage?.toolsAdded?.map((tool) => tool.name),
+      ).toEqual(["stale_tool"]);
+      const forked = SessionManager.forkFrom(sessionFile, root, sessionDir);
+      const forkedNative = forked.getEntry(compactId) as CompactionEntry;
+      expect(forkedNative.type).toBe("compaction");
+      expect(forkedNative.firstKeptEntryId).toBe(firstKeptEntryId);
+
+      const ordinaryTool: Tool = {
+        name: "read",
+        description: "Read a file",
+        parameters: Type.Object({ path: Type.String() }),
+      };
+      for (const supportsMidConvoSystemMessages of [false, true]) {
+        const currentRoute = route({
+          model: codexModel({
+            compat: { supportsMidConvoSystemMessages },
+          }),
+        });
+        const fetchImpl = vi.fn(async () =>
+          successfulResponse(),
+        ) as unknown as typeof fetch;
+        const result = await createRemoteCompaction(
+          {
+            provider: codexProvider,
+            route: currentRoute,
+            identity: resolveRemoteCompactionIdentity(currentRoute)!,
+            preparation: preparation({
+              previousSummary: native.summary,
+              firstKeptEntryId,
+            }),
+            branchEntries: forked.getBranch(),
+            systemPrompt: "current-prompt",
+            tools: [ordinaryTool],
+          },
+          fetchImpl,
+        );
+        const body = JSON.parse(
+          (
+            (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock
+              .calls[0]![1] as RequestInit
+          ).body as string,
+        ) as { instructions?: string; input: unknown[]; tools: unknown[] };
+        expect(body.instructions).toBe("current-prompt");
+        expect(JSON.stringify(body)).not.toContain("stale-native-prompt");
+        expect(JSON.stringify(body)).not.toContain("stale_tool");
+        expect(JSON.stringify(body.input)).toContain("native readable summary");
+        expect(body.tools).toEqual([
+          expect.objectContaining({ type: "function", name: "read" }),
+        ]);
+        expect(result?.firstKeptEntryId).toBe(firstKeptEntryId);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("folds one prior compatible checkpoint and stores only the new one", async () => {

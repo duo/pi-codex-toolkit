@@ -28,6 +28,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+import {
+  resolveInvocation,
+  type ExecutionInvocationHooks,
+} from "./execution-invocation.ts";
+
 export const APPLY_PATCH_TOOL = "apply_patch";
 
 // Narrowed from codex-rs/core/assets/tools/apply_patch.lark at the pinned
@@ -274,7 +279,10 @@ function parsePatch(patch: string, cwd: string): PatchOperation[] {
           index += 1;
           continue;
         }
-        const marker = changeLine[0];
+        // Codex reads a bare empty line inside an Update hunk as an empty
+        // context line (streaming_parser.rs:307-315 at the pinned commit). Add
+        // File above stays strict, as it is upstream.
+        const marker = changeLine === "" ? " " : changeLine[0];
         if (marker !== "+" && marker !== "-" && marker !== " ") {
           throw new PatchValidationError(
             `invalid Update File line for '${path.display}'`,
@@ -521,10 +529,13 @@ function decodeTextFile(
 }
 
 function encodeTextFile(file: TextFile, lines: string[]): Buffer {
+  // An empty source has no final-newline state to preserve: like Add File,
+  // terminate its new content.
+  const terminate = file.trailingNewline || file.lines.length === 0;
   const text =
     lines.length === 0
       ? ""
-      : `${lines.join(file.eol)}${file.trailingNewline ? file.eol : ""}`;
+      : `${lines.join(file.eol)}${terminate ? file.eol : ""}`;
   const encoded = Buffer.from(text, "utf8");
   return file.bom
     ? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), encoded])
@@ -539,16 +550,22 @@ const MATCH_TIERS: MatchTier[] = [
   (left, right) => left.trim() === right.trim(),
 ];
 
-function uniqueSequenceIndex(
+/**
+ * The single location the first productive tier identifies, or `undefined` when
+ * no tier produced a candidate.
+ *
+ * Several candidates in a tier are still the ambiguity failure; only "no
+ * candidate anywhere" is reported to the caller, so a caller that has another
+ * pattern to try can tell the two apart.
+ */
+function findSequenceIndex(
   lines: string[],
   pattern: string[],
   start: number,
   endOfFile: boolean,
   label: string,
-): number {
-  if (pattern.length > lines.length) {
-    throw new PatchValidationError(`context mismatch in '${label}'`);
-  }
+): number | undefined {
+  if (pattern.length > lines.length) return undefined;
   for (const matches of MATCH_TIERS) {
     const candidates: number[] = [];
     if (endOfFile) {
@@ -581,7 +598,21 @@ function uniqueSequenceIndex(
       throw new PatchValidationError(`ambiguous context in '${label}'`);
     }
   }
-  throw new PatchValidationError(`context mismatch in '${label}'`);
+  return undefined;
+}
+
+function uniqueSequenceIndex(
+  lines: string[],
+  pattern: string[],
+  start: number,
+  endOfFile: boolean,
+  label: string,
+): number {
+  const index = findSequenceIndex(lines, pattern, start, endOfFile, label);
+  if (index === undefined) {
+    throw new PatchValidationError(`context mismatch in '${label}'`);
+  }
+  return index;
 }
 
 function applyChunks(
@@ -603,23 +634,60 @@ function applyChunks(
       cursor = locator + 1;
     }
 
+    let oldLines = chunk.oldLines;
+    let newLines = chunk.newLines;
+    let contextLineIndices = chunk.contextLineIndices;
     let changeIndex: number;
-    if (chunk.oldLines.length === 0) {
+    if (oldLines.length === 0) {
       changeIndex = chunk.endOfFile ? lines.length : cursor;
     } else {
-      changeIndex = uniqueSequenceIndex(
+      let found = findSequenceIndex(
         lines,
-        chunk.oldLines,
+        oldLines,
         cursor,
         chunk.endOfFile,
         display,
       );
+      // Codex retries a chunk whose old lines end with an empty element without
+      // that element (file_update.rs:155-168 at the pinned commit), because a
+      // model often ends a hunk with a blank line the source does not have.
+      if (
+        found === undefined &&
+        oldLines.length > 1 &&
+        oldLines.at(-1) === ""
+      ) {
+        // Upstream drops the new side's final element only when it too is empty
+        // (:159-161); a hunk that removes an empty last line keeps its added
+        // lines whole. Unlike upstream, never retry down to an empty pattern:
+        // that would insert at the cursor and bypass the parser's rule that a
+        // pure addition needs a locator or End of File.
+        const shortenedOld = oldLines.slice(0, -1);
+        const shortenedNew =
+          newLines.at(-1) === "" ? newLines.slice(0, -1) : newLines;
+        oldLines = shortenedOld;
+        newLines = shortenedNew;
+        contextLineIndices = contextLineIndices.filter(
+          ([oldIndex, newIndex]) =>
+            oldIndex < shortenedOld.length && newIndex < shortenedNew.length,
+        );
+        found = findSequenceIndex(
+          lines,
+          oldLines,
+          cursor,
+          chunk.endOfFile,
+          display,
+        );
+      }
+      if (found === undefined) {
+        throw new PatchValidationError(`context mismatch in '${display}'`);
+      }
+      changeIndex = found;
     }
-    const replacement = [...chunk.newLines];
-    for (const [oldIndex, newIndex] of chunk.contextLineIndices) {
+    const replacement = [...newLines];
+    for (const [oldIndex, newIndex] of contextLineIndices) {
       replacement[newIndex] = lines[changeIndex + oldIndex];
     }
-    lines.splice(changeIndex, chunk.oldLines.length, ...replacement);
+    lines.splice(changeIndex, oldLines.length, ...replacement);
     cursor = changeIndex + replacement.length;
   }
   return encodeTextFile(source, lines);
@@ -722,12 +790,19 @@ async function stageOperations(
         `.pct-apply-patch-${process.pid}-${randomUUID()}.tmp`,
       );
       try {
-        await writeFile(stagePath, item.output, { flag: "wx", mode: 0o666 });
+        // Create with the source's own mode: the replacement content must never
+        // be readable to more principals than the file it replaces, not even
+        // between this write and the chmod below.
+        await writeFile(stagePath, item.output, {
+          flag: "wx",
+          mode: item.source ? item.source.mode : 0o666,
+        });
       } catch (error) {
         await unlink(stagePath).catch(() => undefined);
         throw error;
       }
       stages.add(stagePath);
+      // Creation applies the umask, so bits it strips still need the chmod.
       if (item.source) await chmod(stagePath, item.source.mode);
       item.stagePath = stagePath;
     }
@@ -892,37 +967,91 @@ async function executePatch(
   }
 }
 
-export const APPLY_PATCH_TOOL_DEFINITION = defineTool({
-  name: APPLY_PATCH_TOOL,
-  label: "Apply Patch",
-  description:
-    "Apply one Codex-format Begin Patch/End Patch text patch to files under the current workspace.",
-  parameters: Type.Object(
-    {
-      patch: Type.String({
-        description: "The complete Codex-format patch envelope.",
-      }),
+/**
+ * Build the tool definition behind an enablement gate.
+ *
+ * The gate is injected rather than read from configuration so this module stays
+ * a leaf: it owns patch parsing and the commit path, and never imports the
+ * config store.
+ */
+function defineApplyPatchTool(
+  isEnabled: () => boolean,
+  invocationHooks?: ExecutionInvocationHooks,
+) {
+  return defineTool({
+    name: APPLY_PATCH_TOOL,
+    label: "Apply Patch",
+    // The literal example matters for providers without grammar transport,
+    // which send this envelope as a JSON string: a live run produced
+    // "*** Begin Patch ***" twice and was rejected before any change.
+    description: `Apply one Codex-format Begin Patch/End Patch text patch to files under the current workspace. A complete minimal envelope is exactly these four lines:
+*** Begin Patch
+*** Add File: notes/todo.md
++first line
+*** End Patch
+Send that text verbatim as the patch argument, with real newline characters (never the two characters backslash and n), no markdown fence and no surrounding quotes. Parsing is strict: the first line is exactly "*** Begin Patch" and the last is exactly "*** End Patch", with no trailing marker such as "*** Begin Patch ***"; every other line belongs to a "*** Add File: path", "*** Delete File: path" or "*** Update File: path" hunk; and a carriage return anywhere in the envelope is rejected. Existing source files, including Delete File targets, must be valid UTF-8 text with consistent LF or CRLF; non-UTF-8, bare CR and mixed line endings are rejected before mutation. Binary deletion is unsupported. A rejected envelope changes nothing.`,
+    parameters: Type.Object(
+      {
+        patch: Type.String({
+          description:
+            'The complete Codex-format patch envelope, starting with the line "*** Begin Patch" and ending with the line "*** End Patch"; see the tool description for a minimal example.',
+        }),
+      },
+      { additionalProperties: false },
+    ),
+    constrainedSampling: {
+      type: "grammar",
+      variants: { openai_lark: APPLY_PATCH_LARK_GRAMMAR },
     },
-    { additionalProperties: false },
-  ),
-  constrainedSampling: {
-    type: "grammar",
-    variants: { openai_lark: APPLY_PATCH_LARK_GRAMMAR },
-  },
-  executionMode: "sequential",
-  execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
-    const operations = await executePatch(params.patch, ctx.cwd, signal);
-    const text = [
-      "Applied patch:",
-      ...operations.map((operation) =>
-        operation.operation === "move"
-          ? `- move ${operation.from} -> ${operation.path}`
-          : `- ${operation.operation} ${operation.path}`,
-      ),
-    ].join("\n");
-    return {
-      content: [{ type: "text", text }],
-      details: { operations },
-    };
-  },
-});
+    executionMode: "sequential",
+    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+      // Refuse before parsing or any filesystem access. Pi activates every
+      // registered extension tool when it builds a session and the Toolkit only
+      // removes disabled names on its own sync, so a dispatch can arrive while
+      // the feature is off. Every sibling capability rechecks here for the same
+      // reason; this one also mutates the workspace.
+      if (!isEnabled()) throw new Error("Apply Patch is not enabled.");
+      // The shared invocation seam, identical to the nested adapter's: the
+      // applicable policy decides before parsing or any filesystem access.
+      // This adds no new feature-local confirmation to direct Apply Patch.
+      await resolveInvocation(invocationHooks, {
+        tool: APPLY_PATCH_TOOL,
+        path: "direct",
+        cwd: ctx.cwd,
+      });
+      // Recheck after the awaited seam and before the first filesystem
+      // access, exactly where the nested adapter rechecks `eligible()`: a
+      // capability disabled or fenced while the hook was pending must not be
+      // overtaken by a call that passed the entry check. Nothing has run.
+      if (!isEnabled()) throw new Error("Apply Patch is not enabled.");
+      const operations = await executePatch(params.patch, ctx.cwd, signal);
+      const text = [
+        "Applied patch:",
+        ...operations.map((operation) =>
+          operation.operation === "move"
+            ? `- move ${operation.from} -> ${operation.path}`
+            : `- ${operation.operation} ${operation.path}`,
+        ),
+      ].join("\n");
+      return {
+        content: [{ type: "text", text }],
+        details: { operations },
+      };
+    },
+  });
+}
+
+/**
+ * Ungated definition, kept for the nested Code Mode adapter, which applies its
+ * own enablement and ownership checks at dispatch time (see `src/index.ts`).
+ * Do not register this with Pi directly — use {@link createApplyPatchTool}.
+ */
+export const APPLY_PATCH_TOOL_DEFINITION = defineApplyPatchTool(() => true);
+
+/** Gated definition for direct Pi dispatch. */
+export function createApplyPatchTool(
+  isEnabled: () => boolean,
+  invocationHooks?: ExecutionInvocationHooks,
+) {
+  return defineApplyPatchTool(isEnabled, invocationHooks);
+}

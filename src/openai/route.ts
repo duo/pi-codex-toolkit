@@ -1,8 +1,23 @@
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, ProviderHeaders } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 
 import type { ModelReference } from "../config.ts";
+
+export function emitProviderRouteResolutionDebug(
+  record: { provider: string; api: string; model: string },
+  output: (line: string) => void = console.error,
+): void {
+  output(
+    JSON.stringify({
+      feature: "provider-request",
+      provider: record.provider,
+      api: record.api,
+      model: record.model,
+      errorCategory: "route-resolution-failed",
+    }),
+  );
+}
 
 export type RouteUnavailableReason =
   | "unsupported-provider"
@@ -26,7 +41,7 @@ export interface AuthenticatedOfficialRoute {
   model: Model<any>;
   route: OfficialRoute;
   token: string;
-  headers: Record<string, string>;
+  headers: ProviderHeaders;
 }
 
 export type AuthenticatedRouteResolution =
@@ -273,14 +288,17 @@ export function inspectSidecarExecutor(
   return { ok: true, model, route: inspection.route };
 }
 
-function stringHeaders(
-  headers: Record<string, string | null> | undefined,
-): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(headers ?? {}).filter(
-      (entry): entry is [string, string] => entry[1] !== null,
-    ),
-  );
+// Apply optional layers before each consumer installs its mandatory headers.
+export function layerOptionalHeaders(
+  modelHeaders: Model<any>["headers"],
+  authHeaders: ProviderHeaders,
+): Headers {
+  const headers = new Headers(modelHeaders);
+  for (const [key, value] of Object.entries(authHeaders)) {
+    if (value === null) headers.delete(key);
+    else headers.set(key, value);
+  }
+  return headers;
 }
 
 export async function resolveOfficialRoute(
@@ -315,7 +333,7 @@ export async function resolveOfficialRoute(
       model,
       route: resolved.route,
       token: auth.apiKey,
-      headers: stringHeaders(auth.headers),
+      headers: { ...auth.headers },
     },
   };
 }

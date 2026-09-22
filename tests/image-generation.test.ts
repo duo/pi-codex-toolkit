@@ -12,7 +12,10 @@ import {
   ImageGenerationError,
   type ImageGenerationResult,
 } from "../src/openai/image-generation.ts";
-import type { AuthenticatedOfficialRoute } from "../src/openai/route.ts";
+import {
+  resolveOfficialRoute,
+  type AuthenticatedOfficialRoute,
+} from "../src/openai/route.ts";
 import { codexModel, model } from "./fixtures.ts";
 
 const PNG = Buffer.from([
@@ -209,6 +212,73 @@ describe("OpenAI image generation protocol", () => {
     expect(headers.get("chatgpt-account-id")).toBe("SECRET_ACCOUNT");
     expect(headers.get("authorization")).toMatch(/^Bearer e30\./);
   });
+
+  it.each(["api-key", "codex-oauth"] as const)(
+    "applies nullable refreshed headers before mandatory %s image headers",
+    async (kind) => {
+      await useTemporaryAgentDirectory();
+      const original = route(kind);
+      original.model.headers = {
+        "X-Optional": "old",
+        "X-Replaced": "old",
+        "X-Kept": "kept",
+        "OpenAI-Beta": "old-beta",
+      };
+      const authHeaders = {
+        "x-optional": null,
+        "x-replaced": "new",
+        "X-Absent": null,
+        Authorization: null,
+        "ChatGPT-Account-ID": null,
+        "Content-Type": null,
+        Accept: null,
+        Originator: null,
+        "X-Codex-Image-Turn-ID": null,
+        "x-openai-beta": "remove-me",
+        "x-codex-beta-features": "remove-me",
+      };
+      const resolved = await resolveOfficialRoute(
+        {
+          getApiKeyAndHeaders: async () => ({
+            ok: true,
+            apiKey: original.token,
+            headers: authHeaders,
+          }),
+          isUsingOAuth: () => kind === "codex-oauth",
+        },
+        original.model,
+      );
+      if (!resolved.ok) throw new Error("test route unavailable");
+      const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+        const headers = new Headers(init?.headers);
+        expect(headers.has("X-Optional")).toBe(false);
+        expect(headers.has("x-absent")).toBe(false);
+        expect(headers.get("x-replaced")).toBe("new");
+        expect(headers.get("x-kept")).toBe("kept");
+        expect(headers.get("authorization")).toBe(`Bearer ${original.token}`);
+        expect(headers.get("chatgpt-account-id")).toBe(
+          kind === "codex-oauth" ? "SECRET_ACCOUNT" : null,
+        );
+        expect(headers.get("content-type")).toBe("application/json");
+        expect(headers.get("accept")).toBe("application/json");
+        expect(headers.get("originator")).toBe("pi");
+        expect(headers.get("x-codex-image-turn-id")).toBe("tool-call-1");
+        for (const key of [
+          "openai-beta",
+          "x-openai-beta",
+          "x-codex-beta-features",
+        ]) {
+          expect(headers.has(key)).toBe(false);
+        }
+        headers.forEach((value) => expect(value).not.toBe("null"));
+        return imageResponse();
+      });
+      await successfulGeneration(fetchMock, resolved.value);
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(original.model.headers["X-Optional"]).toBe("old");
+      expect(authHeaders["x-optional"]).toBeNull();
+    },
+  );
 
   it("creates unique files without changing the first artifact", async () => {
     await useTemporaryAgentDirectory();
@@ -449,7 +519,7 @@ describe("OpenAI image generation protocol", () => {
   });
 });
 
-describe("Pi 0.84.4 image result conversion", () => {
+describe("Pi 0.87 image result conversion", () => {
   it("preserves vision images and uses Pi's text-only omission marker", () => {
     const message: Message = {
       role: "toolResult",

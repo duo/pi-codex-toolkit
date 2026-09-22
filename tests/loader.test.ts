@@ -17,7 +17,7 @@ afterEach(async () => {
 });
 
 describe("Pi extension loading", () => {
-  it("loads the package manifest through Pi 0.84.4 without network access", async () => {
+  it("loads the package manifest through Pi 0.87 without network access", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "pct-resource-loader-"));
     temporaryDirectories.push(agentDir);
     const packageRoot = resolve(".");
@@ -48,12 +48,17 @@ describe("Pi extension loading", () => {
       "openai_web_search",
       "openai_generate_image",
       "apply_patch",
+      "exec_command",
+      "write_stdin",
+      "exec",
+      "wait",
       "computer_use_list_apps",
       "computer_use_get_app_state",
       "computer_use_click",
       "computer_use_type_text",
       "computer_use_press_key",
       "computer_use_scroll",
+      "find_tools",
     ]);
     expect(fetchSpy).not.toHaveBeenCalled();
   });

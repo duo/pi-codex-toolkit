@@ -7,6 +7,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   codexAccountIdFromToken,
   imageGenerationEndpoint,
+  layerOptionalHeaders,
   type AuthenticatedOfficialRoute,
 } from "./route.ts";
 
@@ -67,10 +68,10 @@ export function buildImageGenerationRequest(
 }
 
 function requestHeaders(input: ImageGenerationInput): Headers {
-  const headers = new Headers(input.route.model.headers);
-  new Headers(input.route.headers).forEach((value, key) => {
-    headers.set(key, value);
-  });
+  const headers = layerOptionalHeaders(
+    input.route.model.headers,
+    input.route.headers,
+  );
 
   headers.delete("openai-beta");
   headers.delete("x-openai-beta");

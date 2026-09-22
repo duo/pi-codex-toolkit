@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   codexAccountIdFromToken,
+  emitProviderRouteResolutionDebug,
   imageGenerationEndpoint,
   inspectImageExecutor,
   inspectOfficialRoute,
@@ -22,6 +23,33 @@ function jwt(accountId: string): string {
 }
 
 describe("official OpenAI route boundary", () => {
+  it("emits only fixed provider-route metadata to an injected output", () => {
+    const output = vi.fn();
+    const record = {
+      provider: "openai",
+      api: "openai-responses",
+      model: "gpt-test",
+      feature: "PROTECTED_FEATURE",
+      errorCategory: "PROTECTED_CATEGORY",
+      error: new Error("PROTECTED_ERROR"),
+      token: "PROTECTED_TOKEN",
+      headers: { authorization: "PROTECTED_HEADER" },
+      accountId: "PROTECTED_ACCOUNT",
+      fingerprint: "PROTECTED_FINGERPRINT",
+      payload: "PROTECTED_PAYLOAD",
+    };
+    emitProviderRouteResolutionDebug(record, output);
+    expect(output).toHaveBeenCalledExactlyOnceWith(
+      JSON.stringify({
+        feature: "provider-request",
+        provider: "openai",
+        api: "openai-responses",
+        model: "gpt-test",
+        errorCategory: "route-resolution-failed",
+      }),
+    );
+    expect(output.mock.calls[0]![0]).not.toContain("PROTECTED");
+  });
   it("accepts canonical API-key and Codex OAuth routes", () => {
     expect(inspectOfficialRoute(model())).toMatchObject({
       ok: true,
@@ -107,18 +135,58 @@ describe("official OpenAI route boundary", () => {
   });
 
   it.each([
-    ["scheme", { baseUrl: "http://api.openai.com/v1" }],
-    ["look-alike host", { baseUrl: "https://api.openai.com.evil.test/v1" }],
-    ["userinfo", { baseUrl: "https://user@api.openai.com/v1" }],
-    ["port", { baseUrl: "https://api.openai.com:8443/v1" }],
-    ["path", { baseUrl: "https://api.openai.com/other" }],
-    ["query", { baseUrl: "https://api.openai.com/v1?redirect=1" }],
-    ["hash", { baseUrl: "https://api.openai.com/v1#fragment" }],
-    ["API", { api: "openai-completions" }],
-    ["provider", { provider: "openrouter" }],
-  ])("rejects an invalid %s", (_name, overrides) => {
-    expect(inspectOfficialRoute(model(overrides))).toMatchObject({ ok: false });
+    ["scheme", "http://api.openai.com/v1"],
+    ["look-alike host", "https://api.openai.com.evil.test/v1"],
+    ["userinfo", "https://user@api.openai.com/v1"],
+    ["port", "https://api.openai.com:8443/v1"],
+    ["path", "https://api.openai.com/other"],
+    ["query", "https://api.openai.com/v1?redirect=1"],
+    ["hash", "https://api.openai.com/v1#fragment"],
+  ])("rejects an invalid %s", (_name, baseUrl) => {
+    expect(inspectOfficialRoute(model({ baseUrl }))).toEqual({
+      ok: false,
+      reason: "unofficial-endpoint",
+    });
   });
+
+  it.each([
+    ["API", { api: "openai-completions" }, "unsupported-api"],
+    ["provider", { provider: "openrouter" }, "unsupported-provider"],
+  ])("rejects an invalid %s", (_name, overrides, reason) => {
+    expect(inspectOfficialRoute(model(overrides))).toEqual({
+      ok: false,
+      reason,
+    });
+  });
+
+  // Each official provider accepts only its own Responses API. The check comes
+  // before credential resolution, so a cross-paired model never receives a token.
+  it.each([
+    ["an API-key", model({ api: "openai-codex-responses" })],
+    ["a Codex OAuth", codexModel({ api: "openai-responses" })],
+  ])(
+    "rejects %s model on the other provider's API before resolving credentials",
+    async (_name, current) => {
+      expect(inspectOfficialRoute(current)).toEqual({
+        ok: false,
+        reason: "unsupported-api",
+      });
+      const getApiKeyAndHeaders = vi.fn(async () => ({
+        ok: true as const,
+        apiKey: "credential",
+      }));
+      await expect(
+        resolveOfficialRoute(
+          {
+            getApiKeyAndHeaders,
+            isUsingOAuth: (candidate) => candidate.provider === "openai-codex",
+          },
+          current,
+        ),
+      ).resolves.toEqual({ ok: false, reason: "unsupported-api" });
+      expect(getApiKeyAndHeaders).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     ["scheme", "http://chatgpt.com/backend-api/codex"],
@@ -150,7 +218,7 @@ describe("official OpenAI route boundary", () => {
       ok: true,
       value: {
         token: "test-key",
-        headers: { "x-safe": "value" },
+        headers: { "x-safe": "value", removed: null },
         route: { kind: "api-key" },
       },
     });

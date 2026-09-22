@@ -148,9 +148,10 @@ jobs:
           npm ci --ignore-scripts
           npm test
           npm run typecheck
+          npm run lint
           npm run format:check
 
-      - name: Verify exact tarball with Pi 0.84.4
+      - name: Verify exact tarball with Pi 0.87.0
         working-directory: test-source
         env:
           FILENAME: ${{ steps.package.outputs.filename }}
@@ -174,9 +175,8 @@ jobs:
               timeout 90 "$pi_command" \
                 --no-extensions --extension "$installed_package" \
                 --no-skills --no-prompt-templates --no-themes --no-context-files \
-                --approve --no-session --print '/pct status' > "$status_file"
-            [[ "$(grep -c '^  configured: off$' "$status_file")" -eq 5 ]]
-            [[ "$(grep -c '^  effective: off$' "$status_file")" -eq 5 ]]
+                --approve --no-session --print '/pct status' > "$status_file" 2>&1
+            node tests/fixtures/assert-default-status.mjs "$status_file"
           done
 
           [[ ! -e "$agent_directory/extensions/pi-codex-toolkit.json" ]]

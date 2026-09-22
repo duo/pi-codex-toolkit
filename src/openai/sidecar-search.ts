@@ -1,7 +1,7 @@
 import {
-  calculateCost,
   getSupportedThinkingLevels,
   hasApi,
+  normalizeContext,
 } from "@earendil-works/pi-ai";
 import type {
   Model,
@@ -14,7 +14,11 @@ import type {
   SearchExecutorThinkingLevel,
   WebSearchConfig,
 } from "../config.ts";
-import type { AuthenticatedOfficialRoute } from "./route.ts";
+import {
+  layerOptionalHeaders,
+  type AuthenticatedOfficialRoute,
+} from "./route.ts";
+import { parseResponsesUsage } from "./usage.ts";
 
 export const SIDECAR_TIMEOUT_MS = 30_000;
 const SOURCES_INCLUDE = "web_search_call.action.sources";
@@ -62,47 +66,6 @@ export class SidecarSearchError extends Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function numberValue(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-    ? value
-    : undefined;
-}
-
-function parseUsage(value: unknown, model: Model<any>): Usage | undefined {
-  if (!isRecord(value)) return undefined;
-  const inputTokens = numberValue(value.input_tokens);
-  const outputTokens = numberValue(value.output_tokens);
-  const totalTokens = numberValue(value.total_tokens);
-  if (
-    inputTokens === undefined ||
-    outputTokens === undefined ||
-    totalTokens === undefined
-  ) {
-    return undefined;
-  }
-
-  const inputDetails = isRecord(value.input_tokens_details)
-    ? value.input_tokens_details
-    : {};
-  const outputDetails = isRecord(value.output_tokens_details)
-    ? value.output_tokens_details
-    : {};
-  const cacheRead = numberValue(inputDetails.cached_tokens) ?? 0;
-  const cacheWrite = numberValue(inputDetails.cache_write_tokens) ?? 0;
-  const reasoning = numberValue(outputDetails.reasoning_tokens);
-  const usage: Usage = {
-    input: Math.max(0, inputTokens - cacheRead - cacheWrite),
-    output: outputTokens,
-    cacheRead,
-    cacheWrite,
-    ...(reasoning === undefined ? {} : { reasoning }),
-    totalTokens,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-  };
-  calculateCost(model, usage);
-  return usage;
 }
 
 function normalizedSource(value: unknown): SearchSource | undefined {
@@ -191,7 +154,7 @@ export function parseSidecarResponse(
   return {
     answer,
     sources,
-    usage: parseUsage(value.usage, model),
+    usage: parseResponsesUsage(value.usage, model),
     blockCounts,
   };
 }
@@ -306,7 +269,7 @@ async function dispatchApiKeySearch(input: {
 }): Promise<ParsedResponse> {
   let response: Response;
   try {
-    const headers = new Headers(input.route.headers);
+    const headers = layerOptionalHeaders(undefined, input.route.headers);
     headers.set("authorization", `Bearer ${input.route.token}`);
     headers.set("content-type", "application/json");
     response = await input.fetchImpl(input.route.route.endpoint, {
@@ -355,7 +318,7 @@ async function dispatchCodexSearch(input: {
   }
 
   let fetchCount = 0;
-  let rawText: Promise<string> | undefined;
+  let rawText: Promise<{ ok: true; text: string } | { ok: false }> | undefined;
   let transportCategory: SidecarErrorCategory | undefined;
   const observedFetch: typeof fetch = async (url, init) => {
     fetchCount += 1;
@@ -371,7 +334,15 @@ async function dispatchCodexSearch(input: {
       if (!response.ok) {
         transportCategory = "http-error";
       } else {
-        rawText = response.clone().text();
+        // Own rejection now, even if provider iteration delays or throws before
+        // the later await. Keep original and clone consumption concurrent.
+        rawText = response
+          .clone()
+          .text()
+          .then(
+            (text) => ({ ok: true as const, text }),
+            () => ({ ok: false as const }),
+          );
       }
       return response;
     } catch (error) {
@@ -404,10 +375,10 @@ async function dispatchCodexSearch(input: {
   };
   const stream = input.provider.stream(
     routedModel,
-    {
+    normalizeContext({
       systemPrompt: SIDECAR_SYSTEM_PROMPT,
       messages: [{ role: "user", content: input.query, timestamp: Date.now() }],
-    },
+    }),
     options,
   );
   for await (const event of stream) {
@@ -418,13 +389,9 @@ async function dispatchCodexSearch(input: {
   if (fetchCount !== 1 || !rawText) {
     throw new SidecarSearchError(transportCategory ?? "incomplete-response");
   }
-  let text: string;
-  try {
-    text = await rawText;
-  } catch {
-    throw new SidecarSearchError("network-error");
-  }
-  const parsed = parseCodexSse(text, input.route.model);
+  const body = await rawText;
+  if (!body.ok) throw new SidecarSearchError("network-error");
+  const parsed = parseCodexSse(body.text, input.route.model);
   if (providerError || !providerDone) {
     throw new SidecarSearchError("incomplete-response");
   }

@@ -1,13 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { zstdDecompressSync } from "node:zlib";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 
 import type {
+  Model,
   OpenAICodexResponsesOptions,
   Provider,
 } from "@earendil-works/pi-ai";
 import { openAICodexResponsesApi } from "@earendil-works/pi-ai/compat";
 
-import type { AuthenticatedOfficialRoute } from "../src/openai/route.ts";
+import {
+  resolveOfficialRoute,
+  type AuthenticatedOfficialRoute,
+} from "../src/openai/route.ts";
 import {
   buildSidecarRequest,
   dispatchSidecarSearch,
@@ -15,10 +22,30 @@ import {
   SidecarSearchError,
 } from "../src/openai/sidecar-search.ts";
 import { codexModel, model } from "./fixtures.ts";
+import { outerBudget } from "./fixtures/budgets.ts";
 
 const codexProvider: Pick<Provider, "stream"> = {
   stream: openAICodexResponsesApi().stream,
 };
+
+function observingCodexProvider(): {
+  provider: Pick<Provider, "stream">;
+  reasoningEffort: () => unknown;
+} {
+  let reasoningEffort: unknown;
+  return {
+    provider: {
+      stream: (currentModel, context, streamOptions) => {
+        reasoningEffort =
+          streamOptions && "reasoningEffort" in streamOptions
+            ? streamOptions.reasoningEffort
+            : undefined;
+        return codexProvider.stream(currentModel, context, streamOptions);
+      },
+    },
+    reasoningEffort: () => reasoningEffort,
+  };
+}
 
 function route(): AuthenticatedOfficialRoute {
   return {
@@ -40,11 +67,14 @@ function jwt(accountId: string): string {
   })}.signature`;
 }
 
-function codexRoute(): AuthenticatedOfficialRoute {
+function codexRoute(
+  modelOverrides: Partial<Model<any>> = {},
+): AuthenticatedOfficialRoute {
   return {
     model: codexModel({
       id: "gpt-5.4",
       thinkingLevelMap: { minimal: "low", xhigh: null, max: null },
+      ...modelOverrides,
     }),
     route: {
       kind: "codex-oauth",
@@ -219,6 +249,124 @@ describe("Sidecar request shape", () => {
   });
 });
 
+describe("Sidecar nullable auth headers", () => {
+  it.each(["api-key", "codex-oauth"] as const)(
+    "preserves deletion instructions through the %s wire boundary",
+    async (kind) => {
+      const original = kind === "api-key" ? route() : codexRoute();
+      original.model.headers = {
+        "X-Optional": "old",
+        "X-Replaced": "old",
+        "X-Model-Only": "kept-only-for-codex",
+      };
+      const resolved = await resolveOfficialRoute(
+        {
+          getApiKeyAndHeaders: async () => ({
+            ok: true,
+            apiKey: original.token,
+            headers: {
+              "x-optional": null,
+              "x-replaced": "new",
+              "X-Absent": null,
+              Authorization: null,
+              "Content-Type": null,
+              ...(kind === "codex-oauth"
+                ? {
+                    "ChatGPT-Account-ID": null,
+                    Originator: null,
+                    "OpenAI-Beta": null,
+                    Accept: null,
+                  }
+                : {}),
+            },
+          }),
+          isUsingOAuth: () => kind === "codex-oauth",
+        },
+        original.model,
+      );
+      if (!resolved.ok) throw new Error("test route unavailable");
+      let emitted: Headers | undefined;
+      const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+        emitted = new Headers(init?.headers);
+        return kind === "api-key"
+          ? jsonResponse(completedResponse())
+          : successfulCodexResponse();
+      });
+      await dispatchSidecarSearch(
+        {
+          query: "query",
+          config: { mode: "live", contextSize: "medium" },
+          route: resolved.value,
+          thinkingLevel: "auto",
+          provider: codexProvider,
+        },
+        fetchMock,
+      );
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(emitted?.has("X-Optional")).toBe(false);
+      expect(emitted?.has("x-absent")).toBe(false);
+      expect(emitted?.get("x-replaced")).toBe("new");
+      expect(emitted?.get("x-model-only")).toBe(
+        kind === "codex-oauth" ? "kept-only-for-codex" : null,
+      );
+      expect(emitted?.get("authorization")).toBe(`Bearer ${original.token}`);
+      expect(emitted?.get("content-type")).toBe("application/json");
+      if (kind === "codex-oauth") {
+        expect(emitted?.get("chatgpt-account-id")).toBe("account-test");
+        expect(emitted?.get("originator")).toBe("pi");
+        expect(emitted?.get("openai-beta")).toBe("responses=experimental");
+        expect(emitted?.get("accept")).toBe("text/event-stream");
+      }
+      emitted!.forEach((value) => expect(value).not.toBe("null"));
+      expect(original.model.headers["X-Optional"]).toBe("old");
+    },
+  );
+});
+
+describe("Codex clone-body ownership", () => {
+  // Each case is a fresh Node process that loads the TypeScript compiler to
+  // transpile the Sidecar sources before it can run.
+  const PROBE_TIMEOUT_MS = 40_000;
+
+  it.each([
+    "delayed-done",
+    "delayed-throw",
+    "iterator-first",
+    "aborted",
+    "timeout",
+  ])(
+    "owns a real rejected clone body with %s under strict Node rejection policy",
+    async (scenario) => {
+      const { stdout, stderr } = await promisify(execFile)(
+        process.execPath,
+        [
+          "--unhandled-rejections=strict",
+          fileURLToPath(
+            new URL("./fixtures/sidecar-clone-rejection.mjs", import.meta.url),
+          ),
+          scenario,
+        ],
+        {
+          timeout: PROBE_TIMEOUT_MS,
+          env: { ...process.env, PI_OFFLINE: "1", PI_TELEMETRY: "0" },
+        },
+      );
+      expect(stderr).toBe("");
+      expect(JSON.parse(stdout)).toEqual({
+        scenario,
+        category:
+          scenario === "aborted" || scenario === "timeout"
+            ? scenario
+            : "network-error",
+        fetches: 1,
+        settlements: 1,
+        bodyFailed: true,
+      });
+    },
+    outerBudget(PROBE_TIMEOUT_MS),
+  );
+});
+
 describe("Codex OAuth Sidecar transport", () => {
   it("uses Pi's Codex provider once with query-only hosted Search and mapped effort", async () => {
     const fetchMock = vi.fn(async () => successfulCodexResponse());
@@ -252,6 +400,8 @@ describe("Codex OAuth Sidecar transport", () => {
       model: "gpt-5.4",
       store: false,
       stream: true,
+      instructions:
+        "Search the web for the user's query and answer accurately and concisely.",
       input: [
         {
           role: "user",
@@ -281,31 +431,115 @@ describe("Codex OAuth Sidecar transport", () => {
   });
 
   it.each([
-    ["auto", undefined],
-    ["off", "none"],
-    ["low", "low"],
-  ] as const)("maps executor effort %s independently", async (level, wire) => {
+    {
+      name: "auto",
+      level: "auto" as const,
+      option: undefined,
+      wire: "none",
+    },
+    {
+      name: "off",
+      level: "off" as const,
+      option: "none" as const,
+      wire: "none",
+    },
+    {
+      name: "low",
+      level: "low" as const,
+      option: "low" as const,
+      wire: "low",
+    },
+  ])(
+    "maps executor effort $name independently",
+    async ({ level, option, wire }) => {
+      let body: Record<string, unknown> | undefined;
+      const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+        body = requestJson(init);
+        return successfulCodexResponse();
+      });
+      const observed = observingCodexProvider();
+
+      await dispatchSidecarSearch(
+        {
+          query: "effort query",
+          config: { mode: "live", contextSize: "medium" },
+          route: codexRoute(),
+          thinkingLevel: level,
+          provider: observed.provider,
+        },
+        fetchMock as unknown as typeof fetch,
+      );
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(observed.reasoningEffort()).toBe(option);
+      expect(
+        (body?.reasoning as Record<string, unknown> | undefined)?.effort,
+      ).toBe(wire);
+    },
+  );
+
+  it("keeps auto as no Toolkit override when Off is unsupported", async () => {
     let body: Record<string, unknown> | undefined;
     const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
       body = requestJson(init);
       return successfulCodexResponse();
     });
+    const observed = observingCodexProvider();
 
     await dispatchSidecarSearch(
       {
         query: "effort query",
         config: { mode: "live", contextSize: "medium" },
-        route: codexRoute(),
-        thinkingLevel: level,
-        provider: codexProvider,
+        route: codexRoute({
+          thinkingLevelMap: {
+            off: null,
+            minimal: "low",
+            xhigh: null,
+            max: null,
+          },
+        }),
+        thinkingLevel: "auto",
+        provider: observed.provider,
       },
       fetchMock as unknown as typeof fetch,
     );
 
     expect(fetchMock).toHaveBeenCalledOnce();
+    expect(observed.reasoningEffort()).toBeUndefined();
+    expect(body?.reasoning).toBeUndefined();
+  });
+
+  it("does not force a Toolkit effort when Off maps to a non-default value", async () => {
+    let body: Record<string, unknown> | undefined;
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      body = requestJson(init);
+      return successfulCodexResponse();
+    });
+    const observed = observingCodexProvider();
+
+    await dispatchSidecarSearch(
+      {
+        query: "effort query",
+        config: { mode: "live", contextSize: "medium" },
+        route: codexRoute({
+          thinkingLevelMap: {
+            off: "low",
+            minimal: "low",
+            xhigh: null,
+            max: null,
+          },
+        }),
+        thinkingLevel: "auto",
+        provider: observed.provider,
+      },
+      fetchMock as unknown as typeof fetch,
+    );
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(observed.reasoningEffort()).toBeUndefined();
     expect(
       (body?.reasoning as Record<string, unknown> | undefined)?.effort,
-    ).toBe(wire);
+    ).toBe("low");
   });
 
   it("rejects a missing provider or stale effort before dispatch", async () => {

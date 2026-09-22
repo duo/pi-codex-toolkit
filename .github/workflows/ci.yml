@@ -64,8 +64,17 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Check native status contract coverage
+        run: npm run test:coverage
+
+      - name: Check project coverage floors
+        run: npm run test:coverage:project
+
       - name: Check types
         run: npm run typecheck
+
+      - name: Check lint
+        run: npm run lint
 
       - name: Check formatting
         run: npm run format:check

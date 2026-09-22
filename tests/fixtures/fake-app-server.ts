@@ -1,4 +1,10 @@
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -18,6 +24,7 @@ let elicitationToolCall: Message | undefined;
 let elicitationRequestId: number | string | undefined;
 let elicitationSequence = 0;
 let mcpElicitationsEnabled = false;
+let completedDuringApproval = false;
 
 if (scenario === "delayed-exit") {
   process.on("SIGTERM", () => {
@@ -164,6 +171,10 @@ function requestElicitation(message: Message): void {
 
 function handleToolCall(message: Message): void {
   if (scenario === "hang") return;
+  if (scenario === "unsupported-request") {
+    send({ id: "unsupported-request", method: "foreign/request" });
+    return;
+  }
   if (scenario === "exit") {
     process.stderr.write("PROTECTED_STDERR\n");
     process.exit(17);
@@ -216,6 +227,7 @@ function handleToolCall(message: Message): void {
   }
   if (
     scenario === "elicitation" ||
+    scenario === "elicitation-completes" ||
     scenario === "elicitation-id-collision" ||
     scenario === "foreign-elicitation" ||
     scenario === "wrong-thread-elicitation" ||
@@ -237,6 +249,11 @@ function handleToolCall(message: Message): void {
       return;
     }
     requestElicitation(message);
+    if (scenario === "elicitation-completes" && !completedDuringApproval) {
+      completedDuringApproval = true;
+      replyToTool(message);
+      elicitationToolCall = undefined;
+    }
     return;
   }
   replyToTool(message);
@@ -248,7 +265,8 @@ log({
   cwd: process.cwd(),
 });
 
-createInterface({ input: process.stdin }).on("line", (line) => {
+const input = createInterface({ input: process.stdin });
+input.on("line", (line) => {
   let message: Message;
   try {
     message = JSON.parse(line) as Message;
@@ -257,7 +275,41 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   }
   log({ type: "input", message });
 
+  if (message.method === "fake/hold-input") {
+    // Explicit test-only fault, requested after startup and before invocation.
+    // Pause real stdin consumption, not the parent's writer or virtual clock.
+    // Always release within this finite bound; ordinary scenarios never opt in.
+    const durationMs = message.params?.durationMs;
+    if (
+      typeof durationMs !== "number" ||
+      !Number.isInteger(durationMs) ||
+      durationMs < 1 ||
+      durationMs > 2_000
+    ) {
+      throw new Error("fake input hold requires 1..2000 milliseconds");
+    }
+    input.pause();
+    log({ type: "input-hold", state: "held" });
+    setTimeout(() => {
+      log({ type: "input-hold", state: "released" });
+      input.resume();
+    }, durationMs);
+    send({ id: message.id, result: {} });
+    return;
+  }
+  if (message.method === "fake/close-input") {
+    // Real peer input closure, not a simulated write exception. The finite
+    // watchdog also bounds this child if its isolated supervisor crashes.
+    process.stdin.pause();
+    closeSync(0);
+    send({ method: "fake/input-closed" });
+    setTimeout(() => process.exit(0), 1_000);
+    return;
+  }
   if (message.method === "initialize") {
+    // initialize-hang records the handshake request and never answers it, so
+    // only the client's own request budget can end that start.
+    if (scenario === "initialize-hang") return;
     if (scenario === "startup-exit") {
       process.stderr.write("PROTECTED_STARTUP_STDERR\n");
       process.exit(19);
@@ -267,6 +319,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   }
   if (message.method === "initialized") return;
   if (message.method === "thread/start") {
+    // thread-start-hang answers initialize, then records thread/start and
+    // never answers it: the handshake stalls after a healthy first exchange.
+    if (scenario === "thread-start-hang") return;
     const approvalPolicy = message.params?.approvalPolicy;
     mcpElicitationsEnabled =
       typeof approvalPolicy === "object" &&
@@ -284,14 +339,27 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   }
   if (message.method === "mcpServerStatus/list") {
     readinessChecks += 1;
-    const connected = scenario !== "readiness-delay" || readinessChecks > 1;
+    // readiness-hang-second answers the first poll as starting, then records
+    // the second poll and never answers it, so readiness ends inside a poll.
+    if (scenario === "readiness-hang-second" && readinessChecks >= 2) return;
+    // readiness-status-<status> reports node_repl with that status on every
+    // poll; readiness-never keeps reporting it as starting.
+    const reportedStatus = scenario.startsWith("readiness-status-")
+      ? scenario.slice("readiness-status-".length)
+      : undefined;
+    const connected =
+      reportedStatus === undefined &&
+      scenario !== "readiness-never" &&
+      scenario !== "readiness-hang-second" &&
+      (scenario !== "readiness-delay" || readinessChecks > 1);
     send({
       id: message.id,
       result: {
         data: [
           {
             name: "node_repl",
-            runtimeStatus: connected ? "connected" : "starting",
+            runtimeStatus:
+              reportedStatus ?? (connected ? "connected" : "starting"),
             tools: connected ? { js: {} } : {},
           },
         ],
